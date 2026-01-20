@@ -14,9 +14,10 @@ load_dotenv()
 
 # === НАСТРОЙКИ ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SPREADSHEET_NAME = "Name video Oleh Owl"
-ALLOWED_USER_ID = 7749330261
-# print("Токен бота:", BOT_TOKEN)
+USER_SETTINGS = {
+    7749330261: {"sheet": "Name video Oleh Owl", "tag": "Oleh Owl"},
+    7649695975: {"sheet": "Name video Iryna Techno", "tag": "Iryna Techno"}
+}
 
 # === Google Sheets Авторизация ===
 scope = [
@@ -25,8 +26,6 @@ scope = [
 ]
 creds = Credentials.from_service_account_file("credentials.json", scopes=scope)
 client = gspread.authorize(creds)
-
-sheet = client.open(SPREADSHEET_NAME).sheet1  # Работаем с первым листом
 
 # === Инициализация бота ===
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(
@@ -44,27 +43,31 @@ async def stop_bot(message: Message):
 
 @dp.message()
 async def handle_message(message: Message):
-    if message.from_user.id != ALLOWED_USER_ID:
+    user_id = message.from_user.id
+    if user_id not in USER_SETTINGS:
         await message.answer("⛔ Извините, доступ запрещён.")
         return
+
     text = message.text or message.caption
 
     try:
         lines = text.splitlines()
 
         file_line = next(
-            line for line in lines if "Название файла" in line or "Название крео:" in line or "Файл:" in line)
+            line for line in lines if "Название файла:" in line or "Название крео:" in line or "Файл:" in line)
         card_line = next(
-            line for line in lines if "Название карточки" in line or "Название:" in line or "Карточка:" in line)
+            line for line in lines if "Название карточки:" in line or "Название:" in line or "Карточка:" in line)
 
         file_value = file_line.split(":", 1)[1].strip()
         card_value = card_line.split(":", 1)[1].strip()
 
-        # Извлекаем последние 2 слова из названия таблицы
-        table_suffix = table_suffix = "Oleh Owl"
+        # Получаем настройки пользователя
+        user_settings = USER_SETTINGS[user_id]
+        sheet = client.open(user_settings["sheet"]).sheet1
+        tag = user_settings["tag"]
 
         # Добавляем в таблицу 3 столбец
-        sheet.append_row([file_value, card_value, table_suffix])
+        sheet.append_row([file_value, card_value, tag])
 
         await message.answer("✅ Данные успешно записаны!")
     except Exception as e:
@@ -76,8 +79,7 @@ async def handle_message(message: Message):
 async def main():
     await dp.start_polling(bot)
 
-
 if __name__ == "__main__":
     asyncio.run(main())
-# source venv/bin/activate 
-# python3 main.py    
+# source venv/bin/activate
+# python3 main2user.py
