@@ -3,7 +3,7 @@ import sys
 import os
 import random
 import time
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from collections import deque
 
 from aiogram import Bot, Dispatcher, F
@@ -30,28 +30,21 @@ SCOPES = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive",
 ]
-creds = Credentials.from_service_account_file(
-    "credentials.json", scopes=SCOPES)
+creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
 client = gspread.authorize(creds)
 
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(
-    parse_mode=ParseMode.HTML))
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # Последовательная запись в таблицу
 sheet_lock = asyncio.Lock()
-
-# ===== last_card по юзеру (если альбом без подписи, возьмём последнюю карточку) =====
-# user_id -> {"card": str, "ts": float}
-LAST_CARD: Dict[int, Dict[str, Any]] = {}
-LAST_CARD_TTL = 60 * 60  # 1 час
 
 # ===== альбом-буфер =====
 ALBUMS: Dict[str, Dict[str, Any]] = {}
 ALBUM_WAIT_SEC = 1.2  # ждём "тишину" после последнего сообщения альбома
 
 # ===== очередь записи (надежно дожимаем Google Sheets) =====
-# items: (user_id, chat_id, file, card, tag, future)
+# items: (user_id, chat_id, file, creo, name, tag, future)
 WRITE_QUEUE = deque()
 QUEUE_WORKER_TASK: Optional[asyncio.Task] = None
 
@@ -64,31 +57,53 @@ def now_ts() -> float:
 
 def format_hint() -> str:
     return (
-        "⚠️ Не вижу 'Название карточки'. Пришли текст:\n\n"
-        "Название карточки: Example / 01.01 / ...\n"
+        "⚠️ Не вижу данных для записи.\n\n"
+        "Пришли так (можно просто текстом, без видео):\n"
+        "Название крео: 55IEToday(GPT)O'Leary\n"
+        "Название: Andrii Soprano / 05.02 / IE / 5\n\n"
+        "Или отправь видео/файл с этой подписью."
     )
 
 
-def extract_card(text: str) -> Optional[str]:
+def strip_ext(name: str) -> str:
+    # "a.b.c.mp4" -> "a.b.c"
+    return os.path.splitext(name)[0]
+
+
+def extract_meta(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Понимает:
+      - Название крео:
+      - Название:
+    + терпит варианты:
+      - Крео:
+      - Creo:
+      - Name:
+    """
     if not text:
-        return None
+        return None, None
+
+    creo = None
+    nm = None
+
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if not lines:
-        return None
-    card_keys = ("Название карточки:", "Название:", "Карточка:")
     for ln in lines:
-        if any(k in ln for k in card_keys) and ":" in ln:
+        low = ln.lower()
+
+        if ("название крео" in low or low.startswith("крео:") or low.startswith("creo:")) and ":" in ln:
             v = ln.split(":", 1)[1].strip()
-            return v or None
-    return None
+            if v:
+                creo = v
+
+        if (low.startswith("название:") or low.startswith("name:")) and ":" in ln:
+            v = ln.split(":", 1)[1].strip()
+            if v:
+                nm = v
+
+    return creo, nm
 
 
 def get_filename_or_fallback(message: Message) -> Optional[str]:
-    """
-    Гарантируем имя:
-    - если есть file_name -> используем
-    - иначе -> file_unique_id + расширение
-    """
     if message.document:
         if message.document.file_name:
             return message.document.file_name
@@ -105,6 +120,10 @@ def get_filename_or_fallback(message: Message) -> Optional[str]:
         return f"{message.audio.file_unique_id}.mp3"
 
     return None
+
+
+def is_any_file(message: Message) -> bool:
+    return bool(message.document or message.video or message.audio)
 
 
 def sync_sleep(seconds: float) -> None:
@@ -127,13 +146,6 @@ def append_row_with_retry(sheet, row, retries: int = 10) -> None:
             sync_sleep((2 ** attempt) * 0.6 + random.uniform(0, 0.6))
 
 
-def cleanup_last_card():
-    t = now_ts()
-    for uid in list(LAST_CARD.keys()):
-        if t - float(LAST_CARD[uid]["ts"]) > LAST_CARD_TTL:
-            LAST_CARD.pop(uid, None)
-
-
 # ================== QUEUE ==================
 
 async def ensure_queue_worker():
@@ -142,28 +154,30 @@ async def ensure_queue_worker():
         QUEUE_WORKER_TASK = asyncio.create_task(queue_worker())
 
 
-async def enqueue_write(user_id: int, chat_id: int, file_value: str, card_value: str, tag: str) -> asyncio.Future:
+async def enqueue_write(
+    user_id: int,
+    chat_id: int,
+    file_value: str,
+    creo_value: str,
+    name_value: str,
+    tag: str
+) -> asyncio.Future:
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
-    WRITE_QUEUE.append((user_id, chat_id, file_value, card_value, tag, fut))
+    WRITE_QUEUE.append((user_id, chat_id, file_value, creo_value, name_value, tag, fut))
     await ensure_queue_worker()
     return fut
 
 
 async def queue_worker():
-    """
-    Дожимает очередь. Future завершается только после фактической записи в Google Sheets.
-    """
     while True:
         if not WRITE_QUEUE:
             await asyncio.sleep(0.2)
             continue
 
-        user_id, chat_id, file_value, card_value, tag, fut = WRITE_QUEUE[0]
-
+        user_id, chat_id, file_value, creo_value, name_value, tag, fut = WRITE_QUEUE[0]
         sheet_name = USER_SETTINGS[user_id]["sheet"]
 
-        # открыть sheet с ретраями
         sheet = None
         for _ in range(6):
             try:
@@ -173,22 +187,20 @@ async def queue_worker():
                 await asyncio.sleep(0.7)
 
         if sheet is None:
-            # не получилось открыть — попробуем позже (не выкидываем)
             await asyncio.sleep(1.2)
             continue
 
         try:
             async with sheet_lock:
-                append_row_with_retry(sheet, [file_value, card_value, tag])
+                # Колонки: file | creo | name | tag
+                append_row_with_retry(sheet, [file_value, creo_value, name_value, tag])
 
             if fut and not fut.done():
                 fut.set_result(True)
 
             WRITE_QUEUE.popleft()
 
-        except Exception as e:
-            # временно не вышло — оставляем в очереди и ждём
-            # (по желанию можно логировать)
+        except Exception:
             await asyncio.sleep(1.0)
 
 
@@ -201,7 +213,6 @@ async def flush_album(media_group_id: str):
     if not state:
         return
 
-    # если пришли новые элементы — отложим
     if now_ts() - float(state["last_ts"]) < ALBUM_WAIT_SEC:
         state["flush_task"] = asyncio.create_task(flush_album(media_group_id))
         return
@@ -211,34 +222,23 @@ async def flush_album(media_group_id: str):
     user_id = state["user_id"]
     chat_id = state["chat_id"]
     items: List[str] = state["items"]
-    card: Optional[str] = state.get("card")
 
-    cleanup_last_card()
+    creo = state.get("creo")
+    name = state.get("name")
 
-    # если в альбоме нет card — возьмём last_card по юзеру
-    if not card:
-        lc = LAST_CARD.get(user_id)
-        if lc and (now_ts() - float(lc["ts"]) <= LAST_CARD_TTL):
-            card = str(lc["card"])
-
-    if not card:
+    if not (creo and name):
         await bot.send_message(chat_id, format_hint())
         return
 
-    # запомним last_card
-    LAST_CARD[user_id] = {"card": card, "ts": now_ts()}
-
     tag = USER_SETTINGS[user_id]["tag"]
-
     await bot.send_message(chat_id, f"✅ Принято: {len(items)} файлов. Записываю...")
 
-    # ставим все записи в очередь и ждём реальную запись
     futs = []
     for fname in items:
-        futs.append(await enqueue_write(user_id, chat_id, fname, card, tag))
+        clean = strip_ext(fname)
+        futs.append(await enqueue_write(user_id, chat_id, clean, creo, name, tag))
 
     await asyncio.gather(*futs)
-
     await bot.send_message(chat_id, "Готово!")
 
 
@@ -261,11 +261,9 @@ async def handle_message(message: Message):
         await message.answer("⛔ Доступ запрещён.")
         return
 
-    cleanup_last_card()
-
     text = message.text or message.caption or ""
-    media_group_id = str(
-        message.media_group_id) if message.media_group_id else None
+    creo, name = extract_meta(text)
+    media_group_id = str(message.media_group_id) if message.media_group_id else None
 
     # ===== АЛЬБОМ =====
     if media_group_id:
@@ -274,7 +272,8 @@ async def handle_message(message: Message):
             state = {
                 "user_id": user_id,
                 "chat_id": chat_id,
-                "card": None,
+                "creo": None,
+                "name": None,
                 "items": [],
                 "flush_task": None,
                 "last_ts": now_ts(),
@@ -283,18 +282,16 @@ async def handle_message(message: Message):
 
         state["last_ts"] = now_ts()
 
-        # если в подписи есть карточка — запомним
-        card = extract_card(text)
-        if card:
-            state["card"] = card
-            LAST_CARD[user_id] = {"card": card, "ts": now_ts()}
+        # meta из подписи любого элемента
+        if creo:
+            state["creo"] = creo
+        if name:
+            state["name"] = name
 
-        # добавим файл
         fname = get_filename_or_fallback(message)
         if fname:
             state["items"].append(fname)
 
-        # перезапуск флаша
         task = state.get("flush_task")
         if task and not task.done():
             task.cancel()
@@ -302,31 +299,36 @@ async def handle_message(message: Message):
         return
 
     # ===== НЕ АЛЬБОМ =====
-    card = extract_card(text)
-
-    # если нет card в тексте — пробуем last_card (удобно если файлы шлёшь отдельно)
-    if not card:
-        lc = LAST_CARD.get(user_id)
-        if lc and (now_ts() - float(lc["ts"]) <= LAST_CARD_TTL):
-            card = str(lc["card"])
-
-    if not card:
-        await message.answer(format_hint())
-        return
-
-    LAST_CARD[user_id] = {"card": card, "ts": now_ts()}
-
-    fname = get_filename_or_fallback(message)
-    if not fname:
-        await message.answer("⚠️ Пришли файл/видео вместе с 'Название карточки'.")
-        return
 
     tag = USER_SETTINGS[user_id]["tag"]
 
-    fut = await enqueue_write(user_id, chat_id, fname, card, tag)
+    # 1) Если это просто текст БЕЗ файла — СРАЗУ пишем строку и не ждём видео
+    if not is_any_file(message):
+        if not (creo and name):
+            await message.answer(format_hint())
+            return
+
+        fut = await enqueue_write(user_id, chat_id, "", creo, name, tag)
+        await message.answer("✅ Принято (без файла). Записываю...")
+        await fut
+        await message.answer("Готово! Жду следующую порцию.")
+        return
+
+    # 2) Если пришёл файл — требуем, чтобы meta была В ЭТОМ ЖЕ сообщении (caption)
+    if not (creo and name):
+        await message.answer("⚠️ Для файла нужно добавить подпись с данными.\n\n" + format_hint())
+        return
+
+    fname = get_filename_or_fallback(message)
+    if not fname:
+        await message.answer("⚠️ Пришли файл/видео документом/видео/аудио.")
+        return
+
+    clean = strip_ext(fname)
+    fut = await enqueue_write(user_id, chat_id, clean, creo, name, tag)
     await message.answer("✅ Принято. Записываю...")
     await fut
-    await message.answer("Готово!")
+    await message.answer("Готово! Жду следующую порцию.")
 
 
 # ================== RUN ==================
